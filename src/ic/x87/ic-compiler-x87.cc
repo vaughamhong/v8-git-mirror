@@ -2,8 +2,6 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#include "src/v8.h"
-
 #if V8_TARGET_ARCH_X87
 
 #include "src/ic/ic.h"
@@ -36,7 +34,7 @@ void PropertyICCompiler::GenerateRuntimeSetProperty(
 #undef __
 #define __ ACCESS_MASM(masm())
 
-Handle<Code> PropertyICCompiler::CompilePolymorphic(TypeHandleList* types,
+Handle<Code> PropertyICCompiler::CompilePolymorphic(MapHandleList* maps,
                                                     CodeHandleList* handlers,
                                                     Handle<Name> name,
                                                     Code::StubType type,
@@ -63,24 +61,23 @@ Handle<Code> PropertyICCompiler::CompilePolymorphic(TypeHandleList* types,
   }
 
   Label number_case;
-  Label* smi_target = IncludesNumberType(types) ? &number_case : &miss;
+  Label* smi_target = IncludesNumberMap(maps) ? &number_case : &miss;
   __ JumpIfSmi(receiver(), smi_target);
 
   // Polymorphic keyed stores may use the map register
   Register map_reg = scratch1();
   DCHECK(kind() != Code::KEYED_STORE_IC ||
-         map_reg.is(ElementTransitionAndStoreDescriptor::MapRegister()));
+         map_reg.is(StoreTransitionDescriptor::MapRegister()));
   __ mov(map_reg, FieldOperand(receiver(), HeapObject::kMapOffset));
-  int receiver_count = types->length();
+  int receiver_count = maps->length();
   int number_of_handled_maps = 0;
   for (int current = 0; current < receiver_count; ++current) {
-    Handle<HeapType> type = types->at(current);
-    Handle<Map> map = IC::TypeToMap(*type, isolate());
+    Handle<Map> map = maps->at(current);
     if (!map->is_deprecated()) {
       number_of_handled_maps++;
       Handle<WeakCell> cell = Map::WeakCellForMap(map);
       __ CmpWeakValue(map_reg, cell, scratch2());
-      if (type->Is(HeapType::Number())) {
+      if (map->instance_type() == HEAP_NUMBER_TYPE) {
         DCHECK(!number_case.is_unused());
         __ bind(&number_case);
       }
@@ -129,7 +126,7 @@ Handle<Code> PropertyICCompiler::CompileKeyedStorePolymorphic(
 
 
 #undef __
-}
-}  // namespace v8::internal
+}  // namespace internal
+}  // namespace v8
 
 #endif  // V8_TARGET_ARCH_X87

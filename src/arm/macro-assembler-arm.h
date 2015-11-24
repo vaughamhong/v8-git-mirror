@@ -13,6 +13,19 @@
 namespace v8 {
 namespace internal {
 
+// Give alias names to registers for calling conventions.
+const Register kReturnRegister0 = {kRegister_r0_Code};
+const Register kReturnRegister1 = {kRegister_r1_Code};
+const Register kJSFunctionRegister = {kRegister_r1_Code};
+const Register kContextRegister = {kRegister_r7_Code};
+const Register kInterpreterAccumulatorRegister = {kRegister_r0_Code};
+const Register kInterpreterRegisterFileRegister = {kRegister_r4_Code};
+const Register kInterpreterBytecodeOffsetRegister = {kRegister_r5_Code};
+const Register kInterpreterBytecodeArrayRegister = {kRegister_r6_Code};
+const Register kInterpreterDispatchTableRegister = {kRegister_r8_Code};
+const Register kRuntimeCallFunctionRegister = {kRegister_r1_Code};
+const Register kRuntimeCallArgCountRegister = {kRegister_r0_Code};
+
 // ----------------------------------------------------------------------------
 // Static helper functions
 
@@ -250,7 +263,7 @@ class MacroAssembler: public Assembler {
   // |object| is the object being stored into, |value| is the object being
   // stored.  value and scratch registers are clobbered by the operation.
   // The offset is the offset from the start of the object, not the offset from
-  // the tagged HeapObject pointer.  For use with FieldOperand(reg, off).
+  // the tagged HeapObject pointer.  For use with FieldMemOperand(reg, off).
   void RecordWriteField(
       Register object,
       int offset,
@@ -325,9 +338,7 @@ class MacroAssembler: public Assembler {
 
   // Push three registers.  Pushes leftmost register first (to highest address).
   void Push(Register src1, Register src2, Register src3, Condition cond = al) {
-    DCHECK(!src1.is(src2));
-    DCHECK(!src2.is(src3));
-    DCHECK(!src1.is(src3));
+    DCHECK(!AreAliased(src1, src2, src3));
     if (src1.code() > src2.code()) {
       if (src2.code() > src3.code()) {
         stm(db_w, sp, src1.bit() | src2.bit() | src3.bit(), cond);
@@ -347,12 +358,7 @@ class MacroAssembler: public Assembler {
             Register src3,
             Register src4,
             Condition cond = al) {
-    DCHECK(!src1.is(src2));
-    DCHECK(!src2.is(src3));
-    DCHECK(!src1.is(src3));
-    DCHECK(!src1.is(src4));
-    DCHECK(!src2.is(src4));
-    DCHECK(!src3.is(src4));
+    DCHECK(!AreAliased(src1, src2, src3, src4));
     if (src1.code() > src2.code()) {
       if (src2.code() > src3.code()) {
         if (src3.code() > src4.code()) {
@@ -374,6 +380,36 @@ class MacroAssembler: public Assembler {
     }
   }
 
+  // Push five registers.  Pushes leftmost register first (to highest address).
+  void Push(Register src1, Register src2, Register src3, Register src4,
+            Register src5, Condition cond = al) {
+    DCHECK(!AreAliased(src1, src2, src3, src4, src5));
+    if (src1.code() > src2.code()) {
+      if (src2.code() > src3.code()) {
+        if (src3.code() > src4.code()) {
+          if (src4.code() > src5.code()) {
+            stm(db_w, sp,
+                src1.bit() | src2.bit() | src3.bit() | src4.bit() | src5.bit(),
+                cond);
+          } else {
+            stm(db_w, sp, src1.bit() | src2.bit() | src3.bit() | src4.bit(),
+                cond);
+            str(src5, MemOperand(sp, 4, NegPreIndex), cond);
+          }
+        } else {
+          stm(db_w, sp, src1.bit() | src2.bit() | src3.bit(), cond);
+          Push(src4, src5, cond);
+        }
+      } else {
+        stm(db_w, sp, src1.bit() | src2.bit(), cond);
+        Push(src3, src4, src5, cond);
+      }
+    } else {
+      str(src1, MemOperand(sp, 4, NegPreIndex), cond);
+      Push(src2, src3, src4, src5, cond);
+    }
+  }
+
   // Pop two registers. Pops rightmost register first (from lower address).
   void Pop(Register src1, Register src2, Condition cond = al) {
     DCHECK(!src1.is(src2));
@@ -387,9 +423,7 @@ class MacroAssembler: public Assembler {
 
   // Pop three registers.  Pops rightmost register first (from lower address).
   void Pop(Register src1, Register src2, Register src3, Condition cond = al) {
-    DCHECK(!src1.is(src2));
-    DCHECK(!src2.is(src3));
-    DCHECK(!src1.is(src3));
+    DCHECK(!AreAliased(src1, src2, src3));
     if (src1.code() > src2.code()) {
       if (src2.code() > src3.code()) {
         ldm(ia_w, sp, src1.bit() | src2.bit() | src3.bit(), cond);
@@ -409,12 +443,7 @@ class MacroAssembler: public Assembler {
            Register src3,
            Register src4,
            Condition cond = al) {
-    DCHECK(!src1.is(src2));
-    DCHECK(!src2.is(src3));
-    DCHECK(!src1.is(src3));
-    DCHECK(!src1.is(src4));
-    DCHECK(!src2.is(src4));
-    DCHECK(!src3.is(src4));
+    DCHECK(!AreAliased(src1, src2, src3, src4));
     if (src1.code() > src2.code()) {
       if (src2.code() > src3.code()) {
         if (src3.code() > src4.code()) {
@@ -437,7 +466,7 @@ class MacroAssembler: public Assembler {
   }
 
   // Push a fixed frame, consisting of lr, fp, constant pool (if
-  // FLAG_enable_ool_constant_pool), context and JS function / marker id if
+  // FLAG_enable_embedded_constant_pool), context and JS function / marker id if
   // marker_reg is a valid register.
   void PushFixedFrame(Register marker_reg = no_reg);
   void PopFixedFrame(Register marker_reg = no_reg);
@@ -483,6 +512,12 @@ class MacroAssembler: public Assembler {
     VFPCanonicalizeNaN(value, value, cond);
   }
 
+  // Compare single values and move the result to the normal condition flags.
+  void VFPCompareAndSetFlags(const SwVfpRegister src1, const SwVfpRegister src2,
+                             const Condition cond = al);
+  void VFPCompareAndSetFlags(const SwVfpRegister src1, const float src2,
+                             const Condition cond = al);
+
   // Compare double values and move the result to the normal condition flags.
   void VFPCompareAndSetFlags(const DwVfpRegister src1,
                              const DwVfpRegister src2,
@@ -490,6 +525,15 @@ class MacroAssembler: public Assembler {
   void VFPCompareAndSetFlags(const DwVfpRegister src1,
                              const double src2,
                              const Condition cond = al);
+
+  // Compare single values and then load the fpscr flags to a register.
+  void VFPCompareAndLoadFlags(const SwVfpRegister src1,
+                              const SwVfpRegister src2,
+                              const Register fpscr_flags,
+                              const Condition cond = al);
+  void VFPCompareAndLoadFlags(const SwVfpRegister src1, const float src2,
+                              const Register fpscr_flags,
+                              const Condition cond = al);
 
   // Compare double values and then load the fpscr flags to a register.
   void VFPCompareAndLoadFlags(const DwVfpRegister src1,
@@ -643,19 +687,12 @@ class MacroAssembler: public Assembler {
   // ---------------------------------------------------------------------------
   // Exception handling
 
-  // Push a new try handler and link into try handler chain.
-  void PushTryHandler(StackHandler::Kind kind, int handler_index);
+  // Push a new stack handler and link into stack handler chain.
+  void PushStackHandler();
 
-  // Unlink the stack handler on top of the stack from the try handler chain.
+  // Unlink the stack handler on top of the stack from the stack handler chain.
   // Must preserve the result register.
-  void PopTryHandler();
-
-  // Passes thrown value to the handler of top of the try handler chain.
-  void Throw(Register value);
-
-  // Propagates an uncatchable exception to the top of the current JS stack's
-  // handler chain.
-  void ThrowUncatchable(Register value);
+  void PopStackHandler();
 
   // ---------------------------------------------------------------------------
   // Inline caching support
@@ -716,7 +753,7 @@ class MacroAssembler: public Assembler {
   // ---------------------------------------------------------------------------
   // Allocation support
 
-  // Allocate an object in new space or old pointer space. The object_size is
+  // Allocate an object in new space or old space. The object_size is
   // specified either in bytes or in words if the allocation flag SIZE_IN_WORDS
   // is passed. If the space is exhausted control continues at the gc_required
   // label. The allocated object is returned in result. If the flag
@@ -736,13 +773,6 @@ class MacroAssembler: public Assembler {
                 Register scratch2,
                 Label* gc_required,
                 AllocationFlags flags);
-
-  // Undo allocation in new space. The object passed and objects allocated after
-  // it will no longer be allocated. The caller must make sure that no pointers
-  // are left to the object(s) no longer allocated as they would be invalid when
-  // allocation is undone.
-  void UndoAllocationInNewSpace(Register object, Register scratch);
-
 
   void AllocateTwoByteString(Register result,
                              Register length,
@@ -810,6 +840,11 @@ class MacroAssembler: public Assembler {
 
   // ---------------------------------------------------------------------------
   // Support functions.
+
+  // Machine code version of Map::GetConstructor().
+  // |temp| holds |result|'s map when done, and |temp2| its instance type.
+  void GetMapConstructor(Register result, Register map, Register temp,
+                         Register temp2);
 
   // Try to get function prototype of a function and puts the value in
   // the result register. Checks that the function really is a
@@ -1428,6 +1463,11 @@ class MacroAssembler: public Assembler {
   void JumpIfDictionaryInPrototypeChain(Register object, Register scratch0,
                                         Register scratch1, Label* found);
 
+  // Loads the constant pool pointer (pp) register.
+  void LoadConstantPoolPointerRegisterFromCodeTargetAddress(
+      Register code_target_address);
+  void LoadConstantPoolPointerRegister();
+
  private:
   void CallCFunctionHelper(Register function,
                            int num_reg_arguments,
@@ -1464,17 +1504,10 @@ class MacroAssembler: public Assembler {
                           Register bitmap_reg,
                           Register mask_reg);
 
-  // Helper for throwing exceptions.  Compute a handler address and jump to
-  // it.  See the implementation for register usage.
-  void JumpToHandlerEntry();
-
   // Compute memory operands for safepoint stack slots.
   static int SafepointRegisterStackIndex(int reg_code);
   MemOperand SafepointRegisterSlot(Register reg);
   MemOperand SafepointRegistersAndDoublesSlot(Register reg);
-
-  // Loads the constant pool pointer (pp) register.
-  void LoadConstantPoolPointerRegister();
 
   bool generating_stub_;
   bool has_frame_;
@@ -1502,7 +1535,7 @@ class CodePatcher {
   CodePatcher(byte* address,
               int instructions,
               FlushICache flush_cache = FLUSH);
-  virtual ~CodePatcher();
+  ~CodePatcher();
 
   // Macro assembler to emit code.
   MacroAssembler* masm() { return &masm_; }
@@ -1528,7 +1561,7 @@ class CodePatcher {
 // -----------------------------------------------------------------------------
 // Static helper functions.
 
-inline MemOperand ContextOperand(Register context, int index) {
+inline MemOperand ContextOperand(Register context, int index = 0) {
   return MemOperand(context, Context::SlotOffset(index));
 }
 

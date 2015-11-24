@@ -5,7 +5,6 @@
 #ifndef V8_HEAP_INCREMENTAL_MARKING_H_
 #define V8_HEAP_INCREMENTAL_MARKING_H_
 
-
 #include "src/execution.h"
 #include "src/heap/mark-compact.h"
 #include "src/objects.h"
@@ -26,6 +25,21 @@ class IncrementalMarking {
 
   enum GCRequestType { COMPLETE_MARKING, OVERAPPROXIMATION };
 
+  struct StepActions {
+    StepActions(CompletionAction complete_action_,
+                ForceMarkingAction force_marking_,
+                ForceCompletionAction force_completion_)
+        : completion_action(complete_action_),
+          force_marking(force_marking_),
+          force_completion(force_completion_) {}
+
+    CompletionAction completion_action;
+    ForceMarkingAction force_marking;
+    ForceCompletionAction force_completion;
+  };
+
+  static StepActions IdleStepActions();
+
   explicit IncrementalMarking(Heap* heap);
 
   static void Initialize();
@@ -41,7 +55,8 @@ class IncrementalMarking {
   bool weak_closure_was_overapproximated() const {
     return weak_closure_was_overapproximated_;
   }
-  void set_weak_closure_was_overapproximated(bool val) {
+
+  void SetWeakClosureWasOverApproximatedForTesting(bool val) {
     weak_closure_was_overapproximated_ = val;
   }
 
@@ -53,21 +68,24 @@ class IncrementalMarking {
 
   inline bool IsComplete() { return state() == COMPLETE; }
 
+  inline bool IsReadyToOverApproximateWeakClosure() const {
+    return request_type_ == OVERAPPROXIMATION &&
+           !weak_closure_was_overapproximated_;
+  }
+
   GCRequestType request_type() const { return request_type_; }
 
-  bool WorthActivating();
+  bool CanBeActivated();
 
-  bool ShouldActivate();
+  bool ShouldActivateEvenWithoutIdleNotification();
 
   bool WasActivated();
 
-  enum CompactionFlag { ALLOW_COMPACTION, PREVENT_COMPACTION };
+  void Start(int flags,
+             const GCCallbackFlags gc_callback_flags = kNoGCCallbackFlags,
+             const char* reason = nullptr);
 
-  void Start(CompactionFlag flag = ALLOW_COMPACTION);
-
-  void Stop();
-
-  void PrepareForScavenge();
+  void MarkObjectGroups();
 
   void UpdateMarkingDequeAfterScavenge();
 
@@ -75,9 +93,9 @@ class IncrementalMarking {
 
   void Finalize();
 
-  void Abort();
+  void Stop();
 
-  void OverApproximateWeakClosure();
+  void OverApproximateWeakClosure(CompletionAction action);
 
   void MarkingComplete(CompletionAction action);
 
@@ -163,19 +181,7 @@ class IncrementalMarking {
 
   void ActivateGeneratedStub(Code* stub);
 
-  void NotifyOfHighPromotionRate() {
-    if (IsMarking()) {
-      if (marking_speed_ < kFastMarking) {
-        if (FLAG_trace_gc) {
-          PrintPID(
-              "Increasing marking speed to %d "
-              "due to high promotion rate\n",
-              static_cast<int>(kFastMarking));
-        }
-        marking_speed_ = kFastMarking;
-      }
-    }
-  }
+  void NotifyOfHighPromotionRate();
 
   void EnterNoMarkingScope() { no_marking_scope_depth_++; }
 
@@ -189,6 +195,12 @@ class IncrementalMarking {
 
   bool IsIdleMarkingDelayCounterLimitReached();
 
+  INLINE(static void MarkObject(Heap* heap, HeapObject* object));
+
+  Heap* heap() const { return heap_; }
+
+  GCCallbackFlags CallbackFlags() const { return gc_callback_flags_; }
+
  private:
   int64_t SpaceLeftInOldSpace();
 
@@ -196,7 +208,7 @@ class IncrementalMarking {
 
   void ResetStepCounters();
 
-  void StartMarking(CompactionFlag flag);
+  void StartMarking();
 
   void ActivateIncrementalWriteBarrier(PagedSpace* space);
   static void ActivateIncrementalWriteBarrier(NewSpace* space);
@@ -243,7 +255,11 @@ class IncrementalMarking {
 
   bool weak_closure_was_overapproximated_;
 
+  int weak_closure_approximation_rounds_;
+
   GCRequestType request_type_;
+
+  GCCallbackFlags gc_callback_flags_;
 
   DISALLOW_IMPLICIT_CONSTRUCTORS(IncrementalMarking);
 };

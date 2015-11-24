@@ -2,9 +2,21 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+(function(global, utils) {
+
 'use strict';
 
-var $RegExp = global.RegExp;
+%CheckIsBootstrapping();
+
+// -------------------------------------------------------------------
+// Imports
+
+var GlobalRegExp = global.RegExp;
+var ToString;
+
+utils.Import(function(from) {
+  ToString = from.ToString;
+});
 
 // -------------------------------------------------------------------
 
@@ -12,8 +24,7 @@ var $RegExp = global.RegExp;
 // + https://bugs.ecmascript.org/show_bug.cgi?id=3423
 function RegExpGetFlags() {
   if (!IS_SPEC_OBJECT(this)) {
-    throw MakeTypeError('flags_getter_non_object',
-                        [%ToString(this)]);
+    throw MakeTypeError(kFlagsGetterNonObject, ToString(this));
   }
   var result = '';
   if (this.global) result += 'g';
@@ -24,12 +35,8 @@ function RegExpGetFlags() {
   return result;
 }
 
-function ExtendRegExpPrototype() {
-  %CheckIsBootstrapping();
+%DefineAccessorPropertyUnchecked(GlobalRegExp.prototype, 'flags',
+                                 RegExpGetFlags, null, DONT_ENUM);
+%SetNativeFlag(RegExpGetFlags);
 
-  %DefineAccessorPropertyUnchecked($RegExp.prototype, 'flags', RegExpGetFlags,
-                                   null, DONT_ENUM);
-  %SetNativeFlag(RegExpGetFlags);
-}
-
-ExtendRegExpPrototype();
+})

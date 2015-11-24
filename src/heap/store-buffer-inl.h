@@ -5,6 +5,7 @@
 #ifndef V8_STORE_BUFFER_INL_H_
 #define V8_STORE_BUFFER_INL_H_
 
+#include "src/heap/heap.h"
 #include "src/heap/store-buffer.h"
 
 namespace v8 {
@@ -16,9 +17,7 @@ Address StoreBuffer::TopAddress() {
 
 
 void StoreBuffer::Mark(Address addr) {
-  DCHECK(!heap_->cell_space()->Contains(addr));
   DCHECK(!heap_->code_space()->Contains(addr));
-  DCHECK(!heap_->old_data_space()->Contains(addr));
   Address* top = reinterpret_cast<Address*>(heap_->store_buffer_top());
   *top++ = addr;
   heap_->public_set_store_buffer_top(top);
@@ -33,9 +32,7 @@ void StoreBuffer::Mark(Address addr) {
 
 void StoreBuffer::EnterDirectlyIntoStoreBuffer(Address addr) {
   if (store_buffer_rebuilding_enabled_) {
-    SLOW_DCHECK(!heap_->cell_space()->Contains(addr) &&
-                !heap_->code_space()->Contains(addr) &&
-                !heap_->old_data_space()->Contains(addr) &&
+    SLOW_DCHECK(!heap_->code_space()->Contains(addr) &&
                 !heap_->new_space()->Contains(addr));
     Address* top = old_top_;
     *top++ = addr;
@@ -47,14 +44,6 @@ void StoreBuffer::EnterDirectlyIntoStoreBuffer(Address addr) {
       (*callback_)(heap_, MemoryChunk::FromAnyPointerAddress(heap_, addr),
                    kStoreBufferFullEvent);
     }
-  }
-}
-
-
-void StoreBuffer::ClearDeadObject(HeapObject* object) {
-  Address& map_field = Memory::Address_at(object->address());
-  if (heap_->map_space()->Contains(map_field)) {
-    map_field = NULL;
   }
 }
 }

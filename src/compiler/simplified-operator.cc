@@ -157,40 +157,41 @@ const ElementAccess& ElementAccessOf(const Operator* op) {
 }
 
 
-#define PURE_OP_LIST(V)                                 \
-  V(AnyToBoolean, Operator::kNoProperties, 1)           \
-  V(BooleanNot, Operator::kNoProperties, 1)             \
-  V(BooleanToNumber, Operator::kNoProperties, 1)        \
-  V(NumberEqual, Operator::kCommutative, 2)             \
-  V(NumberLessThan, Operator::kNoProperties, 2)         \
-  V(NumberLessThanOrEqual, Operator::kNoProperties, 2)  \
-  V(NumberAdd, Operator::kCommutative, 2)               \
-  V(NumberSubtract, Operator::kNoProperties, 2)         \
-  V(NumberMultiply, Operator::kCommutative, 2)          \
-  V(NumberDivide, Operator::kNoProperties, 2)           \
-  V(NumberModulus, Operator::kNoProperties, 2)          \
-  V(NumberToInt32, Operator::kNoProperties, 1)          \
-  V(NumberToUint32, Operator::kNoProperties, 1)         \
-  V(PlainPrimitiveToNumber, Operator::kNoProperties, 1) \
-  V(StringEqual, Operator::kCommutative, 2)             \
-  V(StringLessThan, Operator::kNoProperties, 2)         \
-  V(StringLessThanOrEqual, Operator::kNoProperties, 2)  \
-  V(StringAdd, Operator::kNoProperties, 2)              \
-  V(ChangeTaggedToInt32, Operator::kNoProperties, 1)    \
-  V(ChangeTaggedToUint32, Operator::kNoProperties, 1)   \
-  V(ChangeTaggedToFloat64, Operator::kNoProperties, 1)  \
-  V(ChangeInt32ToTagged, Operator::kNoProperties, 1)    \
-  V(ChangeUint32ToTagged, Operator::kNoProperties, 1)   \
-  V(ChangeFloat64ToTagged, Operator::kNoProperties, 1)  \
-  V(ChangeBoolToBit, Operator::kNoProperties, 1)        \
-  V(ChangeBitToBool, Operator::kNoProperties, 1)        \
-  V(ObjectIsSmi, Operator::kNoProperties, 1)            \
+#define PURE_OP_LIST(V)                                  \
+  V(BooleanNot, Operator::kNoProperties, 1)              \
+  V(BooleanToNumber, Operator::kNoProperties, 1)         \
+  V(NumberEqual, Operator::kCommutative, 2)              \
+  V(NumberLessThan, Operator::kNoProperties, 2)          \
+  V(NumberLessThanOrEqual, Operator::kNoProperties, 2)   \
+  V(NumberAdd, Operator::kCommutative, 2)                \
+  V(NumberSubtract, Operator::kNoProperties, 2)          \
+  V(NumberMultiply, Operator::kCommutative, 2)           \
+  V(NumberDivide, Operator::kNoProperties, 2)            \
+  V(NumberModulus, Operator::kNoProperties, 2)           \
+  V(NumberShiftLeft, Operator::kNoProperties, 2)         \
+  V(NumberShiftRight, Operator::kNoProperties, 2)        \
+  V(NumberShiftRightLogical, Operator::kNoProperties, 2) \
+  V(NumberToInt32, Operator::kNoProperties, 1)           \
+  V(NumberToUint32, Operator::kNoProperties, 1)          \
+  V(PlainPrimitiveToNumber, Operator::kNoProperties, 1)  \
+  V(StringEqual, Operator::kCommutative, 2)              \
+  V(StringLessThan, Operator::kNoProperties, 2)          \
+  V(StringLessThanOrEqual, Operator::kNoProperties, 2)   \
+  V(ChangeTaggedToInt32, Operator::kNoProperties, 1)     \
+  V(ChangeTaggedToUint32, Operator::kNoProperties, 1)    \
+  V(ChangeTaggedToFloat64, Operator::kNoProperties, 1)   \
+  V(ChangeInt32ToTagged, Operator::kNoProperties, 1)     \
+  V(ChangeUint32ToTagged, Operator::kNoProperties, 1)    \
+  V(ChangeFloat64ToTagged, Operator::kNoProperties, 1)   \
+  V(ChangeBoolToBit, Operator::kNoProperties, 1)         \
+  V(ChangeBitToBool, Operator::kNoProperties, 1)         \
+  V(ObjectIsSmi, Operator::kNoProperties, 1)             \
   V(ObjectIsNonNegativeSmi, Operator::kNoProperties, 1)
 
 
-struct SimplifiedOperatorGlobalCache FINAL {
+struct SimplifiedOperatorGlobalCache final {
 #define PURE(Name, properties, input_count)                                \
-  struct Name##Operator FINAL : public Operator {                          \
+  struct Name##Operator final : public Operator {                          \
     Name##Operator()                                                       \
         : Operator(IrOpcode::k##Name, Operator::kPure | properties, #Name, \
                    input_count, 0, 0, 1, 0, 0) {}                          \
@@ -200,14 +201,14 @@ struct SimplifiedOperatorGlobalCache FINAL {
 #undef PURE
 
 #define BUFFER_ACCESS(Type, type, TYPE, ctype, size)                          \
-  struct LoadBuffer##Type##Operator FINAL : public Operator1<BufferAccess> {  \
+  struct LoadBuffer##Type##Operator final : public Operator1<BufferAccess> {  \
     LoadBuffer##Type##Operator()                                              \
         : Operator1<BufferAccess>(IrOpcode::kLoadBuffer,                      \
                                   Operator::kNoThrow | Operator::kNoWrite,    \
                                   "LoadBuffer", 3, 1, 1, 1, 1, 0,             \
                                   BufferAccess(kExternal##Type##Array)) {}    \
   };                                                                          \
-  struct StoreBuffer##Type##Operator FINAL : public Operator1<BufferAccess> { \
+  struct StoreBuffer##Type##Operator final : public Operator1<BufferAccess> { \
     StoreBuffer##Type##Operator()                                             \
         : Operator1<BufferAccess>(IrOpcode::kStoreBuffer,                     \
                                   Operator::kNoRead | Operator::kNoThrow,     \
@@ -240,6 +241,13 @@ const Operator* SimplifiedOperatorBuilder::ReferenceEqual(Type* type) {
   return new (zone()) Operator(IrOpcode::kReferenceEqual,
                                Operator::kCommutative | Operator::kPure,
                                "ReferenceEqual", 2, 0, 0, 1, 0, 0);
+}
+
+
+const Operator* SimplifiedOperatorBuilder::Allocate(PretenureFlag pretenure) {
+  return new (zone())
+      Operator1<PretenureFlag>(IrOpcode::kAllocate, Operator::kNoThrow,
+                               "Allocate", 1, 1, 1, 1, 1, 0, pretenure);
 }
 
 

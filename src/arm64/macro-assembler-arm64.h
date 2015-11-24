@@ -7,11 +7,10 @@
 
 #include <vector>
 
+#include "src/arm64/assembler-arm64.h"
 #include "src/bailout-reason.h"
-#include "src/globals.h"
-
-#include "src/arm64/assembler-arm64-inl.h"
 #include "src/base/bits.h"
+#include "src/globals.h"
 
 // Simulator specific helpers.
 #if USE_SIMULATOR
@@ -33,6 +32,20 @@
 
 namespace v8 {
 namespace internal {
+
+// Give alias names to registers for calling conventions.
+// TODO(titzer): arm64 is a pain for aliasing; get rid of these macros
+#define kReturnRegister0 x0
+#define kReturnRegister1 x1
+#define kJSFunctionRegister x1
+#define kContextRegister cp
+#define kInterpreterAccumulatorRegister x0
+#define kInterpreterRegisterFileRegister x18
+#define kInterpreterBytecodeOffsetRegister x19
+#define kInterpreterBytecodeArrayRegister x20
+#define kInterpreterDispatchTableRegister x21
+#define kRuntimeCallFunctionRegister x1
+#define kRuntimeCallArgCountRegister x0
 
 #define LS_MACRO_LIST(V)                                      \
   V(Ldrb, Register&, rt, LDRB_w)                              \
@@ -569,6 +582,10 @@ class MacroAssembler : public Assembler {
             const CPURegister& src6 = NoReg, const CPURegister& src7 = NoReg);
   void Pop(const CPURegister& dst0, const CPURegister& dst1 = NoReg,
            const CPURegister& dst2 = NoReg, const CPURegister& dst3 = NoReg);
+  void Pop(const CPURegister& dst0, const CPURegister& dst1,
+           const CPURegister& dst2, const CPURegister& dst3,
+           const CPURegister& dst4, const CPURegister& dst5 = NoReg,
+           const CPURegister& dst6 = NoReg, const CPURegister& dst7 = NoReg);
   void Push(const Register& src0, const FPRegister& src1);
 
   // Alternative forms of Push and Pop, taking a RegList or CPURegList that
@@ -886,8 +903,8 @@ class MacroAssembler : public Assembler {
 
   template<typename Field>
   void DecodeField(Register dst, Register src) {
-    static const uint64_t shift = Field::kShift;
-    static const uint64_t setbits = CountSetBits(Field::kMask, 32);
+    static const int shift = Field::kShift;
+    static const int setbits = CountSetBits(Field::kMask, 32);
     Ubfx(dst, src, shift, setbits);
   }
 
@@ -1077,22 +1094,6 @@ class MacroAssembler : public Assembler {
 
   // This is required for compatibility in architecture indepenedant code.
   inline void jmp(Label* L) { B(L); }
-
-  // Passes thrown value to the handler of top of the try handler chain.
-  // Register value must be x0.
-  void Throw(Register value,
-             Register scratch1,
-             Register scratch2,
-             Register scratch3,
-             Register scratch4);
-
-  // Propagates an uncatchable exception to the top of the current JS stack's
-  // handler chain. Register value must be x0.
-  void ThrowUncatchable(Register value,
-                        Register scratch1,
-                        Register scratch2,
-                        Register scratch3,
-                        Register scratch4);
 
   void CallStub(CodeStub* stub, TypeFeedbackId ast_id = TypeFeedbackId::None());
   void TailCallStub(CodeStub* stub);
@@ -1289,18 +1290,18 @@ class MacroAssembler : public Assembler {
   // ---------------------------------------------------------------------------
   // Exception handling
 
-  // Push a new try handler and link into try handler chain.
-  void PushTryHandler(StackHandler::Kind kind, int handler_index);
+  // Push a new stack handler and link into stack handler chain.
+  void PushStackHandler();
 
-  // Unlink the stack handler on top of the stack from the try handler chain.
+  // Unlink the stack handler on top of the stack from the stack handler chain.
   // Must preserve the result register.
-  void PopTryHandler();
+  void PopStackHandler();
 
 
   // ---------------------------------------------------------------------------
   // Allocation support
 
-  // Allocate an object in new space or old pointer space. The object_size is
+  // Allocate an object in new space or old space. The object_size is
   // specified either in bytes or in words if the allocation flag SIZE_IN_WORDS
   // is passed. The allocated object is returned in result.
   //
@@ -1320,12 +1321,6 @@ class MacroAssembler : public Assembler {
                 Register scratch2,
                 Label* gc_required,
                 AllocationFlags flags);
-
-  // Undo allocation in new space. The object passed and objects allocated after
-  // it will no longer be allocated. The caller must make sure that no pointers
-  // are left to the object(s) no longer allocated as they would be invalid when
-  // allocation is undone.
-  void UndoAllocationInNewSpace(Register object, Register scratch);
 
   void AllocateTwoByteString(Register result,
                              Register length,
@@ -1377,6 +1372,11 @@ class MacroAssembler : public Assembler {
     kMissOnBoundFunction,
     kDontMissOnBoundFunction
   };
+
+  // Machine code version of Map::GetConstructor().
+  // |temp| holds |result|'s map when done, and |temp2| its instance type.
+  void GetMapConstructor(Register result, Register map, Register temp,
+                         Register temp2);
 
   void TryGetFunctionPrototype(Register function,
                                Register result,
@@ -1782,7 +1782,7 @@ class MacroAssembler : public Assembler {
   // |object| is the object being stored into, |value| is the object being
   // stored.  value and scratch registers are clobbered by the operation.
   // The offset is the offset from the start of the object, not the offset from
-  // the tagged HeapObject pointer.  For use with FieldOperand(reg, off).
+  // the tagged HeapObject pointer.  For use with FieldMemOperand(reg, off).
   void RecordWriteField(
       Register object,
       int offset,
@@ -2070,14 +2070,6 @@ class MacroAssembler : public Assembler {
   // have mixed types. The format string (x0) should not be included.
   void CallPrintf(int arg_count = 0, const CPURegister * args = NULL);
 
-  // Helper for throwing exceptions.  Compute a handler address and jump to
-  // it.  See the implementation for register usage.
-  void JumpToHandlerEntry(Register exception,
-                          Register object,
-                          Register state,
-                          Register scratch1,
-                          Register scratch2);
-
   // Helper for implementing JumpIfNotInNewSpace and JumpIfInNewSpace.
   void InNewSpace(Register object,
                   Condition cond,  // eq for new space, ne otherwise.
@@ -2254,7 +2246,7 @@ class UseScratchRegisterScope {
 };
 
 
-inline MemOperand ContextMemOperand(Register context, int index) {
+inline MemOperand ContextMemOperand(Register context, int index = 0) {
   return MemOperand(context, Context::SlotOffset(index));
 }
 

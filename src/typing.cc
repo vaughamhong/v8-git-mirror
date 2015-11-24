@@ -9,6 +9,7 @@
 #include "src/ostreams.h"
 #include "src/parser.h"  // for CompileTimeValue; TODO(rossberg): should move
 #include "src/scopes.h"
+#include "src/splay-tree-inl.h"
 
 namespace v8 {
 namespace internal {
@@ -36,13 +37,8 @@ void AstTyper::Run(CompilationInfo* info) {
   AstTyper* visitor = new(info->zone()) AstTyper(info);
   Scope* scope = info->scope();
 
-  // Handle implicit declaration of the function name in named function
-  // expressions before other declarations.
-  if (scope->is_function_scope() && scope->function() != NULL) {
-    RECURSE(visitor->VisitVariableDeclaration(scope->function()));
-  }
   RECURSE(visitor->VisitDeclarations(scope->declarations()));
-  RECURSE(visitor->VisitStatements(info->function()->body()));
+  RECURSE(visitor->VisitStatements(info->literal()->body()));
 }
 
 #undef RECURSE
@@ -105,7 +101,9 @@ void AstTyper::ObserveTypesAtOsrEntry(IterationStatement* stmt) {
 
     ZoneList<Variable*> local_vars(locals, zone());
     ZoneList<Variable*> context_vars(scope->ContextLocalCount(), zone());
-    scope->CollectStackAndContextLocals(&local_vars, &context_vars);
+    ZoneList<Variable*> global_vars(scope->ContextGlobalCount(), zone());
+    scope->CollectStackAndContextLocals(&local_vars, &context_vars,
+                                        &global_vars);
     for (int i = 0; i < locals; i++) {
       PrintObserved(local_vars.at(i),
                     frame->GetExpression(i),
@@ -346,9 +344,7 @@ void AstTyper::VisitDebuggerStatement(DebuggerStatement* stmt) {
 }
 
 
-void AstTyper::VisitFunctionLiteral(FunctionLiteral* expr) {
-  expr->InitializeSharedInfo(Handle<Code>(info_->closure()->shared()->code()));
-}
+void AstTyper::VisitFunctionLiteral(FunctionLiteral* expr) {}
 
 
 void AstTyper::VisitClassLiteral(ClassLiteral* expr) {}
@@ -410,7 +406,12 @@ void AstTyper::VisitObjectLiteral(ObjectLiteral* expr) {
       if (!prop->is_computed_name() &&
           prop->key()->AsLiteral()->value()->IsInternalizedString() &&
           prop->emit_store()) {
-        prop->RecordTypeFeedback(oracle());
+        // Record type feed back for the property.
+        TypeFeedbackId id = prop->key()->AsLiteral()->LiteralFeedbackId();
+        SmallMapList maps;
+        oracle()->CollectReceiverTypes(id, &maps);
+        prop->set_receiver_type(maps.length() == 1 ? maps.at(0)
+                                                   : Handle<Map>::null());
       }
     }
 
@@ -428,7 +429,7 @@ void AstTyper::VisitArrayLiteral(ArrayLiteral* expr) {
     RECURSE(Visit(value));
   }
 
-  NarrowType(expr, Bounds(Type::Array(zone())));
+  NarrowType(expr, Bounds(Type::Object(zone())));
 }
 
 
@@ -487,35 +488,20 @@ void AstTyper::VisitThrow(Throw* expr) {
 void AstTyper::VisitProperty(Property* expr) {
   // Collect type feedback.
   FeedbackVectorICSlot slot(FeedbackVectorICSlot::Invalid());
-  TypeFeedbackId id(TypeFeedbackId::None());
-  if (FLAG_vector_ics) {
-    slot = expr->PropertyFeedbackSlot();
-    expr->set_is_uninitialized(oracle()->LoadIsUninitialized(slot));
-  } else {
-    id = expr->PropertyFeedbackId();
-    expr->set_is_uninitialized(oracle()->LoadIsUninitialized(id));
-  }
+  slot = expr->PropertyFeedbackSlot();
+  expr->set_inline_cache_state(oracle()->LoadInlineCacheState(slot));
 
   if (!expr->IsUninitialized()) {
     if (expr->key()->IsPropertyName()) {
       Literal* lit_key = expr->key()->AsLiteral();
       DCHECK(lit_key != NULL && lit_key->value()->IsString());
       Handle<String> name = Handle<String>::cast(lit_key->value());
-      if (FLAG_vector_ics) {
-        oracle()->PropertyReceiverTypes(slot, name, expr->GetReceiverTypes());
-      } else {
-        oracle()->PropertyReceiverTypes(id, name, expr->GetReceiverTypes());
-      }
+      oracle()->PropertyReceiverTypes(slot, name, expr->GetReceiverTypes());
     } else {
       bool is_string;
       IcCheckType key_type;
-      if (FLAG_vector_ics) {
-        oracle()->KeyedPropertyReceiverTypes(slot, expr->GetReceiverTypes(),
-                                             &is_string, &key_type);
-      } else {
-        oracle()->KeyedPropertyReceiverTypes(id, expr->GetReceiverTypes(),
-                                             &is_string, &key_type);
-      }
+      oracle()->KeyedPropertyReceiverTypes(slot, expr->GetReceiverTypes(),
+                                           &is_string, &key_type);
       expr->set_is_string_access(is_string);
       expr->set_key_type(key_type);
     }
@@ -562,7 +548,17 @@ void AstTyper::VisitCall(Call* expr) {
 
 void AstTyper::VisitCallNew(CallNew* expr) {
   // Collect type feedback.
-  expr->RecordTypeFeedback(oracle());
+  FeedbackVectorSlot allocation_site_feedback_slot =
+      FLAG_pretenuring_call_new ? expr->AllocationSiteFeedbackSlot()
+                                : expr->CallNewFeedbackSlot();
+  expr->set_allocation_site(
+      oracle()->GetCallNewAllocationSite(allocation_site_feedback_slot));
+  bool monomorphic =
+      oracle()->CallNewIsMonomorphic(expr->CallNewFeedbackSlot());
+  expr->set_is_monomorphic(monomorphic);
+  if (monomorphic) {
+    expr->set_target(oracle()->GetCallNewTarget(expr->CallNewFeedbackSlot()));
+  }
 
   RECURSE(Visit(expr->expression()));
   ZoneList<Expression*>* args = expr->arguments();
@@ -640,7 +636,7 @@ void AstTyper::VisitBinaryOperation(BinaryOperation* expr) {
   Type* type;
   Type* left_type;
   Type* right_type;
-  Maybe<int> fixed_right_arg;
+  Maybe<int> fixed_right_arg = Nothing<int>();
   Handle<AllocationSite> allocation_site;
   oracle()->BinaryType(expr->BinaryOperationFeedbackId(),
       &left_type, &right_type, &type, &fixed_right_arg,
@@ -754,11 +750,17 @@ void AstTyper::VisitCompareOperation(CompareOperation* expr) {
 }
 
 
+void AstTyper::VisitSpread(Spread* expr) { RECURSE(Visit(expr->expression())); }
+
+
 void AstTyper::VisitThisFunction(ThisFunction* expr) {
 }
 
 
-void AstTyper::VisitSuperReference(SuperReference* expr) {}
+void AstTyper::VisitSuperPropertyReference(SuperPropertyReference* expr) {}
+
+
+void AstTyper::VisitSuperCallReference(SuperCallReference* expr) {}
 
 
 void AstTyper::VisitDeclarations(ZoneList<Declaration*>* decls) {
@@ -778,13 +780,7 @@ void AstTyper::VisitFunctionDeclaration(FunctionDeclaration* declaration) {
 }
 
 
-void AstTyper::VisitModuleDeclaration(ModuleDeclaration* declaration) {
-  RECURSE(Visit(declaration->module()));
-}
-
-
 void AstTyper::VisitImportDeclaration(ImportDeclaration* declaration) {
-  RECURSE(Visit(declaration->module()));
 }
 
 
@@ -792,23 +788,5 @@ void AstTyper::VisitExportDeclaration(ExportDeclaration* declaration) {
 }
 
 
-void AstTyper::VisitModuleLiteral(ModuleLiteral* module) {
-  RECURSE(Visit(module->body()));
-}
-
-
-void AstTyper::VisitModulePath(ModulePath* module) {
-  RECURSE(Visit(module->module()));
-}
-
-
-void AstTyper::VisitModuleUrl(ModuleUrl* module) {
-}
-
-
-void AstTyper::VisitModuleStatement(ModuleStatement* stmt) {
-  RECURSE(Visit(stmt->body()));
-}
-
-
-} }  // namespace v8::internal
+}  // namespace internal
+}  // namespace v8

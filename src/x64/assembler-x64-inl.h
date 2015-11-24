@@ -8,7 +8,7 @@
 #include "src/x64/assembler-x64.h"
 
 #include "src/base/cpu.h"
-#include "src/debug.h"
+#include "src/debug/debug.h"
 #include "src/v8memory.h"
 
 namespace v8 {
@@ -234,6 +234,16 @@ void Assembler::emit_vex_prefix(XMMRegister reg, XMMRegister vreg,
 }
 
 
+void Assembler::emit_vex_prefix(Register reg, Register vreg, Register rm,
+                                VectorLength l, SIMDPrefix pp, LeadingOpcode mm,
+                                VexW w) {
+  XMMRegister ireg = {reg.code()};
+  XMMRegister ivreg = {vreg.code()};
+  XMMRegister irm = {rm.code()};
+  emit_vex_prefix(ireg, ivreg, irm, l, pp, mm, w);
+}
+
+
 void Assembler::emit_vex_prefix(XMMRegister reg, XMMRegister vreg,
                                 const Operand& rm, VectorLength l,
                                 SIMDPrefix pp, LeadingOpcode mm, VexW w) {
@@ -248,14 +258,21 @@ void Assembler::emit_vex_prefix(XMMRegister reg, XMMRegister vreg,
 }
 
 
-Address Assembler::target_address_at(Address pc,
-                                     ConstantPoolArray* constant_pool) {
+void Assembler::emit_vex_prefix(Register reg, Register vreg, const Operand& rm,
+                                VectorLength l, SIMDPrefix pp, LeadingOpcode mm,
+                                VexW w) {
+  XMMRegister ireg = {reg.code()};
+  XMMRegister ivreg = {vreg.code()};
+  emit_vex_prefix(ireg, ivreg, rm, l, pp, mm, w);
+}
+
+
+Address Assembler::target_address_at(Address pc, Address constant_pool) {
   return Memory::int32_at(pc) + pc + 4;
 }
 
 
-void Assembler::set_target_address_at(Address pc,
-                                      ConstantPoolArray* constant_pool,
+void Assembler::set_target_address_at(Address pc, Address constant_pool,
                                       Address target,
                                       ICacheFlushMode icache_flush_mode) {
   Memory::int32_at(pc) = static_cast<int32_t>(target - pc - 4);
@@ -265,13 +282,14 @@ void Assembler::set_target_address_at(Address pc,
 }
 
 
-Address Assembler::target_address_from_return_address(Address pc) {
-  return pc - kCallTargetAddressOffset;
+void Assembler::deserialization_set_target_internal_reference_at(
+    Address pc, Address target, RelocInfo::Mode mode) {
+  Memory::Address_at(pc) = target;
 }
 
 
-Address Assembler::break_address_from_return_address(Address pc) {
-  return pc - Assembler::kPatchDebugBreakSlotReturnOffset;
+Address Assembler::target_address_from_return_address(Address pc) {
+  return pc - kCallTargetAddressOffset;
 }
 
 
@@ -288,21 +306,17 @@ Address Assembler::runtime_entry_at(Address pc) {
 // Implementation of RelocInfo
 
 // The modes possibly affected by apply must be in kApplyMask.
-void RelocInfo::apply(intptr_t delta, ICacheFlushMode icache_flush_mode) {
-  bool flush_icache = icache_flush_mode != SKIP_ICACHE_FLUSH;
-  if (IsInternalReference(rmode_)) {
-    // absolute code pointer inside code object moves with the code object.
-    Memory::Address_at(pc_) += delta;
-    if (flush_icache) CpuFeatures::FlushICache(pc_, sizeof(Address));
-  } else if (IsCodeTarget(rmode_) || IsRuntimeEntry(rmode_)) {
+void RelocInfo::apply(intptr_t delta) {
+  if (IsCodeTarget(rmode_) || IsRuntimeEntry(rmode_)) {
     Memory::int32_at(pc_) -= static_cast<int32_t>(delta);
-    if (flush_icache) CpuFeatures::FlushICache(pc_, sizeof(int32_t));
-  } else if (rmode_ == CODE_AGE_SEQUENCE) {
+  } else if (IsCodeAgeSequence(rmode_)) {
     if (*pc_ == kCallOpcode) {
       int32_t* p = reinterpret_cast<int32_t*>(pc_ + 1);
       *p -= static_cast<int32_t>(delta);  // Relocate entry.
-      if (flush_icache) CpuFeatures::FlushICache(p, sizeof(uint32_t));
     }
+  } else if (IsInternalReference(rmode_)) {
+    // absolute code pointer inside code object moves with the code object.
+    Memory::Address_at(pc_) += delta;
   }
 }
 
@@ -366,9 +380,21 @@ Handle<Object> RelocInfo::target_object_handle(Assembler* origin) {
 }
 
 
-Address RelocInfo::target_reference() {
+Address RelocInfo::target_external_reference() {
   DCHECK(rmode_ == RelocInfo::EXTERNAL_REFERENCE);
   return Memory::Address_at(pc_);
+}
+
+
+Address RelocInfo::target_internal_reference() {
+  DCHECK(rmode_ == INTERNAL_REFERENCE);
+  return Memory::Address_at(pc_);
+}
+
+
+Address RelocInfo::target_internal_reference_address() {
+  DCHECK(rmode_ == INTERNAL_REFERENCE);
+  return reinterpret_cast<Address>(pc_);
 }
 
 
@@ -438,7 +464,8 @@ void RelocInfo::set_target_cell(Cell* cell,
 
 
 void RelocInfo::WipeOut() {
-  if (IsEmbeddedObject(rmode_) || IsExternalReference(rmode_)) {
+  if (IsEmbeddedObject(rmode_) || IsExternalReference(rmode_) ||
+      IsInternalReference(rmode_)) {
     Memory::Address_at(pc_) = NULL;
   } else if (IsCodeTarget(rmode_) || IsRuntimeEntry(rmode_)) {
     // Effectively write zero into the relocation.
@@ -490,44 +517,23 @@ void RelocInfo::set_code_age_stub(Code* stub,
 }
 
 
-Address RelocInfo::call_address() {
-  DCHECK((IsJSReturn(rmode()) && IsPatchedReturnSequence()) ||
-         (IsDebugBreakSlot(rmode()) && IsPatchedDebugBreakSlotSequence()));
-  return Memory::Address_at(
-      pc_ + Assembler::kRealPatchReturnSequenceAddressOffset);
+Address RelocInfo::debug_call_address() {
+  DCHECK(IsDebugBreakSlot(rmode()) && IsPatchedDebugBreakSlotSequence());
+  return Memory::Address_at(pc_ + Assembler::kPatchDebugBreakSlotAddressOffset);
 }
 
 
-void RelocInfo::set_call_address(Address target) {
-  DCHECK((IsJSReturn(rmode()) && IsPatchedReturnSequence()) ||
-         (IsDebugBreakSlot(rmode()) && IsPatchedDebugBreakSlotSequence()));
-  Memory::Address_at(pc_ + Assembler::kRealPatchReturnSequenceAddressOffset) =
+void RelocInfo::set_debug_call_address(Address target) {
+  DCHECK(IsDebugBreakSlot(rmode()) && IsPatchedDebugBreakSlotSequence());
+  Memory::Address_at(pc_ + Assembler::kPatchDebugBreakSlotAddressOffset) =
       target;
-  CpuFeatures::FlushICache(
-      pc_ + Assembler::kRealPatchReturnSequenceAddressOffset, sizeof(Address));
+  CpuFeatures::FlushICache(pc_ + Assembler::kPatchDebugBreakSlotAddressOffset,
+                           sizeof(Address));
   if (host() != NULL) {
     Object* target_code = Code::GetCodeFromTargetAddress(target);
     host()->GetHeap()->incremental_marking()->RecordWriteIntoCode(
         host(), this, HeapObject::cast(target_code));
   }
-}
-
-
-Object* RelocInfo::call_object() {
-  return *call_object_address();
-}
-
-
-void RelocInfo::set_call_object(Object* target) {
-  *call_object_address() = target;
-}
-
-
-Object** RelocInfo::call_object_address() {
-  DCHECK((IsJSReturn(rmode()) && IsPatchedReturnSequence()) ||
-         (IsDebugBreakSlot(rmode()) && IsPatchedDebugBreakSlotSequence()));
-  return reinterpret_cast<Object**>(
-      pc_ + Assembler::kPatchReturnSequenceAddressOffset);
 }
 
 
@@ -542,14 +548,12 @@ void RelocInfo::Visit(Isolate* isolate, ObjectVisitor* visitor) {
     visitor->VisitCell(this);
   } else if (mode == RelocInfo::EXTERNAL_REFERENCE) {
     visitor->VisitExternalReference(this);
-    CpuFeatures::FlushICache(pc_, sizeof(Address));
+  } else if (mode == RelocInfo::INTERNAL_REFERENCE) {
+    visitor->VisitInternalReference(this);
   } else if (RelocInfo::IsCodeAgeSequence(mode)) {
     visitor->VisitCodeAgeSequence(this);
-  } else if (((RelocInfo::IsJSReturn(mode) &&
-              IsPatchedReturnSequence()) ||
-             (RelocInfo::IsDebugBreakSlot(mode) &&
-              IsPatchedDebugBreakSlotSequence())) &&
-             isolate->debug()->has_break_points()) {
+  } else if (RelocInfo::IsDebugBreakSlot(mode) &&
+             IsPatchedDebugBreakSlotSequence()) {
     visitor->VisitDebugTarget(this);
   } else if (RelocInfo::IsRuntimeEntry(mode)) {
     visitor->VisitRuntimeEntry(this);
@@ -569,14 +573,12 @@ void RelocInfo::Visit(Heap* heap) {
     StaticVisitor::VisitCell(heap, this);
   } else if (mode == RelocInfo::EXTERNAL_REFERENCE) {
     StaticVisitor::VisitExternalReference(this);
-    CpuFeatures::FlushICache(pc_, sizeof(Address));
+  } else if (mode == RelocInfo::INTERNAL_REFERENCE) {
+    StaticVisitor::VisitInternalReference(this);
   } else if (RelocInfo::IsCodeAgeSequence(mode)) {
     StaticVisitor::VisitCodeAgeSequence(heap, this);
-  } else if (heap->isolate()->debug()->has_break_points() &&
-             ((RelocInfo::IsJSReturn(mode) &&
-              IsPatchedReturnSequence()) ||
-             (RelocInfo::IsDebugBreakSlot(mode) &&
-              IsPatchedDebugBreakSlotSequence()))) {
+  } else if (RelocInfo::IsDebugBreakSlot(mode) &&
+             IsPatchedDebugBreakSlotSequence()) {
     StaticVisitor::VisitDebugTarget(heap, this);
   } else if (RelocInfo::IsRuntimeEntry(mode)) {
     StaticVisitor::VisitRuntimeEntry(this);

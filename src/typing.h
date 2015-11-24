@@ -5,8 +5,6 @@
 #ifndef V8_TYPING_H_
 #define V8_TYPING_H_
 
-#include "src/v8.h"
-
 #include "src/allocation.h"
 #include "src/ast.h"
 #include "src/effects.h"
@@ -69,10 +67,10 @@ class AstTyper: public AstVisitor {
            var->IsParameter() ? parameter_index(var->index()) : kNoVar;
   }
 
-  void VisitDeclarations(ZoneList<Declaration*>* declarations) OVERRIDE;
-  void VisitStatements(ZoneList<Statement*>* statements) OVERRIDE;
+  void VisitDeclarations(ZoneList<Declaration*>* declarations) override;
+  void VisitStatements(ZoneList<Statement*>* statements) override;
 
-#define DECLARE_VISIT(type) virtual void Visit##type(type* node) OVERRIDE;
+#define DECLARE_VISIT(type) virtual void Visit##type(type* node) override;
   AST_NODE_LIST(DECLARE_VISIT)
 #undef DECLARE_VISIT
 

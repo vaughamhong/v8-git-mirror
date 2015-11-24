@@ -2,14 +2,15 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#include "src/v8.h"
+#include "src/runtime/runtime-utils.h"
 
 #include "src/accessors.h"
 #include "src/arguments.h"
 #include "src/compiler.h"
+#include "src/cpu-profiler.h"
 #include "src/deoptimizer.h"
-#include "src/frames.h"
-#include "src/runtime/runtime-utils.h"
+#include "src/frames-inl.h"
+#include "src/messages.h"
 
 namespace v8 {
 namespace internal {
@@ -32,32 +33,6 @@ RUNTIME_FUNCTION(Runtime_IsSloppyModeFunction) {
 }
 
 
-RUNTIME_FUNCTION(Runtime_GetDefaultReceiver) {
-  SealHandleScope shs(isolate);
-  DCHECK(args.length() == 1);
-  CONVERT_ARG_CHECKED(JSReceiver, callable, 0);
-
-  if (!callable->IsJSFunction()) {
-    HandleScope scope(isolate);
-    Handle<Object> delegate;
-    ASSIGN_RETURN_FAILURE_ON_EXCEPTION(
-        isolate, delegate, Execution::TryGetFunctionDelegate(
-                               isolate, Handle<JSReceiver>(callable)));
-    callable = JSFunction::cast(*delegate);
-  }
-  JSFunction* function = JSFunction::cast(callable);
-
-  SharedFunctionInfo* shared = function->shared();
-  if (shared->native() || is_strict(shared->language_mode())) {
-    return isolate->heap()->undefined_value();
-  }
-  // Returns undefined for strict or native functions, or
-  // the associated global receiver for "normal" functions.
-
-  return function->global_proxy();
-}
-
-
 RUNTIME_FUNCTION(Runtime_FunctionGetName) {
   SealHandleScope shs(isolate);
   DCHECK(args.length() == 1);
@@ -67,32 +42,15 @@ RUNTIME_FUNCTION(Runtime_FunctionGetName) {
 }
 
 
-static Handle<String> NameToFunctionName(Handle<Name> name) {
-  Handle<String> stringName(name->GetHeap()->empty_string());
-
-  // TODO(caitp): Follow proper rules in section 9.2.11 (SetFunctionName)
-  if (name->IsSymbol()) {
-    Handle<Object> description(Handle<Symbol>::cast(name)->name(),
-                               name->GetIsolate());
-    if (description->IsString()) {
-      stringName = Handle<String>::cast(description);
-    }
-  } else {
-    stringName = Handle<String>::cast(name);
-  }
-
-  return stringName;
-}
-
-
 RUNTIME_FUNCTION(Runtime_FunctionSetName) {
   HandleScope scope(isolate);
   DCHECK(args.length() == 2);
 
   CONVERT_ARG_HANDLE_CHECKED(JSFunction, f, 0);
-  CONVERT_ARG_HANDLE_CHECKED(Name, name, 1);
+  CONVERT_ARG_HANDLE_CHECKED(String, name, 1);
 
-  f->shared()->set_name(*NameToFunctionName(name));
+  name = String::Flatten(name);
+  f->shared()->set_name(*name);
   return isolate->heap()->undefined_value();
 }
 
@@ -273,7 +231,6 @@ RUNTIME_FUNCTION(Runtime_SetCode) {
   target_shared->set_feedback_vector(source_shared->feedback_vector());
   target_shared->set_internal_formal_parameter_count(
       source_shared->internal_formal_parameter_count());
-  target_shared->set_script(source_shared->script());
   target_shared->set_start_position_and_type(
       source_shared->start_position_and_type());
   target_shared->set_end_position(source_shared->end_position());
@@ -283,6 +240,8 @@ RUNTIME_FUNCTION(Runtime_SetCode) {
       source_shared->opt_count_and_bailout_reason());
   target_shared->set_native(was_native);
   target_shared->set_profiler_ticks(source_shared->profiler_ticks());
+  SharedFunctionInfo::SetScript(
+      target_shared, Handle<Object>(source_shared->script(), isolate));
 
   // Set the code of the target function.
   target->ReplaceCode(source_shared->code());
@@ -294,10 +253,6 @@ RUNTIME_FUNCTION(Runtime_SetCode) {
   int number_of_literals = source->NumberOfLiterals();
   Handle<FixedArray> literals =
       isolate->factory()->NewFixedArray(number_of_literals, TENURED);
-  if (number_of_literals > 0) {
-    literals->set(JSFunction::kLiteralNativeContextIndex,
-                  context->native_context());
-  }
   target->set_context(*context);
   target->set_literals(*literals);
 
@@ -356,14 +311,14 @@ RUNTIME_FUNCTION(Runtime_IsConstructor) {
 }
 
 
-RUNTIME_FUNCTION(Runtime_SetInlineBuiltinFlag) {
+RUNTIME_FUNCTION(Runtime_SetForceInlineFlag) {
   SealHandleScope shs(isolate);
   RUNTIME_ASSERT(args.length() == 1);
   CONVERT_ARG_HANDLE_CHECKED(Object, object, 0);
 
   if (object->IsJSFunction()) {
     JSFunction* func = JSFunction::cast(*object);
-    func->shared()->set_inline_builtin(true);
+    func->shared()->set_force_inline(true);
   }
   return isolate->heap()->undefined_value();
 }
@@ -372,9 +327,8 @@ RUNTIME_FUNCTION(Runtime_SetInlineBuiltinFlag) {
 // Find the arguments of the JavaScript function invocation that called
 // into C++ code. Collect these in a newly allocated array of handles (possibly
 // prefixed by a number of empty handles).
-static SmartArrayPointer<Handle<Object> > GetCallerArguments(Isolate* isolate,
-                                                             int prefix_argc,
-                                                             int* total_argc) {
+static base::SmartArrayPointer<Handle<Object> > GetCallerArguments(
+    Isolate* isolate, int prefix_argc, int* total_argc) {
   // Find frame containing arguments passed to the caller.
   JavaScriptFrameIterator it(isolate);
   JavaScriptFrame* frame = it.frame();
@@ -382,22 +336,36 @@ static SmartArrayPointer<Handle<Object> > GetCallerArguments(Isolate* isolate,
   frame->GetFunctions(&functions);
   if (functions.length() > 1) {
     int inlined_jsframe_index = functions.length() - 1;
-    JSFunction* inlined_function = functions[inlined_jsframe_index];
-    SlotRefValueBuilder slot_refs(
-        frame, inlined_jsframe_index,
-        inlined_function->shared()->internal_formal_parameter_count());
+    TranslatedState translated_values(frame);
+    translated_values.Prepare(false, frame->fp());
 
-    int args_count = slot_refs.args_length();
+    int argument_count = 0;
+    TranslatedFrame* translated_frame =
+        translated_values.GetArgumentsInfoFromJSFrameIndex(
+            inlined_jsframe_index, &argument_count);
+    TranslatedFrame::iterator iter = translated_frame->begin();
 
-    *total_argc = prefix_argc + args_count;
-    SmartArrayPointer<Handle<Object> > param_data(
+    // Skip the function.
+    iter++;
+
+    // Skip the receiver.
+    iter++;
+    argument_count--;
+
+    *total_argc = prefix_argc + argument_count;
+    base::SmartArrayPointer<Handle<Object> > param_data(
         NewArray<Handle<Object> >(*total_argc));
-    slot_refs.Prepare(isolate);
-    for (int i = 0; i < args_count; i++) {
-      Handle<Object> val = slot_refs.GetNext(isolate, 0);
-      param_data[prefix_argc + i] = val;
+    bool should_deoptimize = false;
+    for (int i = 0; i < argument_count; i++) {
+      should_deoptimize = should_deoptimize || iter->IsMaterializedObject();
+      Handle<Object> value = iter->GetValue();
+      param_data[prefix_argc + i] = value;
+      iter++;
     }
-    slot_refs.Finish(isolate);
+
+    if (should_deoptimize) {
+      translated_values.StoreMaterializedValuesAndDeopt();
+    }
 
     return param_data;
   } else {
@@ -406,7 +374,7 @@ static SmartArrayPointer<Handle<Object> > GetCallerArguments(Isolate* isolate,
     int args_count = frame->ComputeParametersCount();
 
     *total_argc = prefix_argc + args_count;
-    SmartArrayPointer<Handle<Object> > param_data(
+    base::SmartArrayPointer<Handle<Object> > param_data(
         NewArray<Handle<Object> >(*total_argc));
     for (int i = 0; i < args_count; i++) {
       Handle<Object> val = Handle<Object>(frame->GetParameter(i), isolate);
@@ -427,9 +395,11 @@ RUNTIME_FUNCTION(Runtime_FunctionBindArguments) {
 
   // TODO(lrn): Create bound function in C++ code from premade shared info.
   bound_function->shared()->set_bound(true);
+  bound_function->shared()->set_optimized_code_map(Smi::FromInt(0));
+  bound_function->shared()->set_inferred_name(isolate->heap()->empty_string());
   // Get all arguments of calling function (Function.prototype.bind).
   int argc = 0;
-  SmartArrayPointer<Handle<Object> > arguments =
+  base::SmartArrayPointer<Handle<Object> > arguments =
       GetCallerArguments(isolate, 0, &argc);
   // Don't count the this-arg.
   if (argc > 0) {
@@ -471,12 +441,24 @@ RUNTIME_FUNCTION(Runtime_FunctionBindArguments) {
   // Update length. Have to remove the prototype first so that map migration
   // is happy about the number of fields.
   RUNTIME_ASSERT(bound_function->RemovePrototype());
+
+  // The new function should have the same [[Prototype]] as the bindee.
   Handle<Map> bound_function_map(
       isolate->native_context()->bound_function_map());
+  PrototypeIterator iter(isolate, bindee);
+  Handle<Object> proto = PrototypeIterator::GetCurrent(iter);
+  if (bound_function_map->prototype() != *proto) {
+    bound_function_map = Map::TransitionToPrototype(bound_function_map, proto,
+                                                    REGULAR_PROTOTYPE);
+  }
   JSObject::MigrateToMap(bound_function, bound_function_map);
+
   Handle<String> length_string = isolate->factory()->length_string();
+  // These attributes must be kept in sync with how the bootstrapper
+  // configures the bound_function_map retrieved above.
+  // We use ...IgnoreAttributes() here because of length's read-onliness.
   PropertyAttributes attr =
-      static_cast<PropertyAttributes>(DONT_DELETE | DONT_ENUM | READ_ONLY);
+      static_cast<PropertyAttributes>(DONT_ENUM | READ_ONLY);
   RETURN_FAILURE_ON_EXCEPTION(
       isolate, JSObject::SetOwnPropertyIgnoreAttributes(
                    bound_function, length_string, new_length, attr));
@@ -519,7 +501,7 @@ RUNTIME_FUNCTION(Runtime_NewObjectFromBound) {
          !Handle<JSFunction>::cast(bound_function)->shared()->bound());
 
   int total_argc = 0;
-  SmartArrayPointer<Handle<Object> > param_data =
+  base::SmartArrayPointer<Handle<Object> > param_data =
       GetCallerArguments(isolate, bound_argc, &total_argc);
   for (int i = 0; i < bound_argc; i++) {
     param_data[i] = Handle<Object>(
@@ -551,12 +533,12 @@ RUNTIME_FUNCTION(Runtime_Call) {
   // If there are too many arguments, allocate argv via malloc.
   const int argv_small_size = 10;
   Handle<Object> argv_small_buffer[argv_small_size];
-  SmartArrayPointer<Handle<Object> > argv_large_buffer;
+  base::SmartArrayPointer<Handle<Object> > argv_large_buffer;
   Handle<Object>* argv = argv_small_buffer;
   if (argc > argv_small_size) {
     argv = new Handle<Object>[argc];
     if (argv == NULL) return isolate->StackOverflow();
-    argv_large_buffer = SmartArrayPointer<Handle<Object> >(argv);
+    argv_large_buffer = base::SmartArrayPointer<Handle<Object> >(argv);
   }
 
   for (int i = 0; i < argc; ++i) {
@@ -590,12 +572,12 @@ RUNTIME_FUNCTION(Runtime_Apply) {
   // If there are too many arguments, allocate argv via malloc.
   const int argv_small_size = 10;
   Handle<Object> argv_small_buffer[argv_small_size];
-  SmartArrayPointer<Handle<Object> > argv_large_buffer;
+  base::SmartArrayPointer<Handle<Object> > argv_large_buffer;
   Handle<Object>* argv = argv_small_buffer;
   if (argc > argv_small_size) {
     argv = new Handle<Object>[argc];
     if (argv == NULL) return isolate->StackOverflow();
-    argv_large_buffer = SmartArrayPointer<Handle<Object> >(argv);
+    argv_large_buffer = base::SmartArrayPointer<Handle<Object> >(argv);
   }
 
   for (int i = 0; i < argc; ++i) {
@@ -629,13 +611,23 @@ RUNTIME_FUNCTION(Runtime_GetConstructorDelegate) {
 }
 
 
-RUNTIME_FUNCTION(RuntimeReference_CallFunction) {
+RUNTIME_FUNCTION(Runtime_GetOriginalConstructor) {
+  SealHandleScope shs(isolate);
+  DCHECK(args.length() == 0);
+  JavaScriptFrameIterator it(isolate);
+  JavaScriptFrame* frame = it.frame();
+  return frame->IsConstructor() ? frame->GetOriginalConstructor()
+                                : isolate->heap()->undefined_value();
+}
+
+
+RUNTIME_FUNCTION(Runtime_CallFunction) {
   SealHandleScope shs(isolate);
   return __RT_impl_Runtime_Call(args, isolate);
 }
 
 
-RUNTIME_FUNCTION(RuntimeReference_IsConstructCall) {
+RUNTIME_FUNCTION(Runtime_IsConstructCall) {
   SealHandleScope shs(isolate);
   DCHECK(args.length() == 0);
   JavaScriptFrameIterator it(isolate);
@@ -644,11 +636,19 @@ RUNTIME_FUNCTION(RuntimeReference_IsConstructCall) {
 }
 
 
-RUNTIME_FUNCTION(RuntimeReference_IsFunction) {
+RUNTIME_FUNCTION(Runtime_IsFunction) {
   SealHandleScope shs(isolate);
   DCHECK(args.length() == 1);
   CONVERT_ARG_CHECKED(Object, obj, 0);
   return isolate->heap()->ToBoolean(obj->IsJSFunction());
 }
+
+
+RUNTIME_FUNCTION(Runtime_ThrowStrongModeTooFewArguments) {
+  HandleScope scope(isolate);
+  DCHECK(args.length() == 0);
+  THROW_NEW_ERROR_RETURN_FAILURE(isolate,
+                                 NewTypeError(MessageTemplate::kStrongArity));
 }
-}  // namespace v8::internal
+}  // namespace internal
+}  // namespace v8

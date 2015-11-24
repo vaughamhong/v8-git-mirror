@@ -3,10 +3,15 @@
 // found in the LICENSE file.
 
 #include "src/api-natives.h"
-#include "src/isolate-inl.h"
+
+#include "src/api.h"
+#include "src/isolate.h"
+#include "src/lookup.h"
+#include "src/messages.h"
 
 namespace v8 {
 namespace internal {
+
 
 namespace {
 
@@ -32,11 +37,12 @@ MaybeHandle<Object> Instantiate(Isolate* isolate, Handle<Object> data,
 }
 
 
-MaybeHandle<Object> DefineAccessorProperty(
-    Isolate* isolate, Handle<JSObject> object, Handle<Name> name,
-    Handle<Object> getter, Handle<Object> setter, Smi* attributes) {
-  DCHECK(PropertyDetails::AttributesField::is_valid(
-      static_cast<PropertyAttributes>(attributes->value())));
+MaybeHandle<Object> DefineAccessorProperty(Isolate* isolate,
+                                           Handle<JSObject> object,
+                                           Handle<Name> name,
+                                           Handle<Object> getter,
+                                           Handle<Object> setter,
+                                           PropertyAttributes attributes) {
   if (!getter->IsUndefined()) {
     ASSIGN_RETURN_ON_EXCEPTION(
         isolate, getter,
@@ -51,10 +57,8 @@ MaybeHandle<Object> DefineAccessorProperty(
                             Handle<FunctionTemplateInfo>::cast(setter)),
         Object);
   }
-  RETURN_ON_EXCEPTION(isolate,
-                      JSObject::DefineAccessor(
-                          object, name, getter, setter,
-                          static_cast<PropertyAttributes>(attributes->value())),
+  RETURN_ON_EXCEPTION(isolate, JSObject::DefineAccessor(object, name, getter,
+                                                        setter, attributes),
                       Object);
   return object;
 }
@@ -62,46 +66,29 @@ MaybeHandle<Object> DefineAccessorProperty(
 
 MaybeHandle<Object> DefineDataProperty(Isolate* isolate,
                                        Handle<JSObject> object,
-                                       Handle<Name> key,
+                                       Handle<Name> name,
                                        Handle<Object> prop_data,
-                                       Smi* unchecked_attributes) {
-  DCHECK((unchecked_attributes->value() &
-          ~(READ_ONLY | DONT_ENUM | DONT_DELETE)) == 0);
-  // Compute attributes.
-  PropertyAttributes attributes =
-      static_cast<PropertyAttributes>(unchecked_attributes->value());
-
+                                       PropertyAttributes attributes) {
   Handle<Object> value;
   ASSIGN_RETURN_ON_EXCEPTION(isolate, value,
-                             Instantiate(isolate, prop_data, key), Object);
+                             Instantiate(isolate, prop_data, name), Object);
+
+  LookupIterator it = LookupIterator::PropertyOrElement(
+      isolate, object, name, LookupIterator::OWN_SKIP_INTERCEPTOR);
 
 #ifdef DEBUG
-  bool duplicate;
-  if (key->IsName()) {
-    LookupIterator it(object, Handle<Name>::cast(key),
-                      LookupIterator::OWN_SKIP_INTERCEPTOR);
-    Maybe<PropertyAttributes> maybe = JSReceiver::GetPropertyAttributes(&it);
-    DCHECK(maybe.has_value);
-    duplicate = it.IsFound();
-  } else {
-    uint32_t index = 0;
-    key->ToArrayIndex(&index);
-    Maybe<bool> maybe = JSReceiver::HasOwnElement(object, index);
-    if (!maybe.has_value) return MaybeHandle<Object>();
-    duplicate = maybe.value;
-  }
-  if (duplicate) {
-    Handle<Object> args[1] = {key};
-    THROW_NEW_ERROR(isolate, NewTypeError("duplicate_template_property",
-                                          HandleVector(args, 1)),
-                    Object);
+  Maybe<PropertyAttributes> maybe = JSReceiver::GetPropertyAttributes(&it);
+  DCHECK(maybe.IsJust());
+  if (it.IsFound()) {
+    THROW_NEW_ERROR(
+        isolate,
+        NewTypeError(MessageTemplate::kDuplicateTemplateProperty, name),
+        Object);
   }
 #endif
 
-  RETURN_ON_EXCEPTION(
-      isolate, Runtime::DefineObjectProperty(object, key, value, attributes),
-      Object);
-  return object;
+  return Object::AddDataProperty(&it, value, attributes, STRICT,
+                                 Object::CERTAINLY_NOT_STORE_FROM_KEYED);
 }
 
 
@@ -156,27 +143,28 @@ MaybeHandle<JSObject> ConfigureInstance(Isolate* isolate, Handle<JSObject> obj,
   HandleScope scope(isolate);
   // Disable access checks while instantiating the object.
   AccessCheckDisableScope access_check_scope(isolate, obj);
-  for (int i = 0; i < properties.length();) {
-    int length = Smi::cast(properties.get(i))->value();
-    if (length == 3) {
-      auto name = handle(Name::cast(properties.get(i + 1)), isolate);
-      auto prop_data = handle(properties.get(i + 2), isolate);
-      auto attributes = Smi::cast(properties.get(i + 3));
+
+  int i = 0;
+  for (int c = 0; c < data->number_of_properties(); c++) {
+    auto name = handle(Name::cast(properties.get(i++)), isolate);
+    PropertyDetails details(Smi::cast(properties.get(i++)));
+    PropertyAttributes attributes = details.attributes();
+    PropertyKind kind = details.kind();
+
+    if (kind == kData) {
+      auto prop_data = handle(properties.get(i++), isolate);
+
       RETURN_ON_EXCEPTION(isolate, DefineDataProperty(isolate, obj, name,
                                                       prop_data, attributes),
                           JSObject);
     } else {
-      DCHECK(length == 4);
-      auto name = handle(Name::cast(properties.get(i + 1)), isolate);
-      auto getter = handle(properties.get(i + 2), isolate);
-      auto setter = handle(properties.get(i + 3), isolate);
-      auto attributes = Smi::cast(properties.get(i + 4));
+      auto getter = handle(properties.get(i++), isolate);
+      auto setter = handle(properties.get(i++), isolate);
       RETURN_ON_EXCEPTION(isolate,
                           DefineAccessorProperty(isolate, obj, name, getter,
                                                  setter, attributes),
                           JSObject);
     }
-    i += length + 1;
   }
   return obj;
 }
@@ -207,36 +195,33 @@ MaybeHandle<JSObject> InstantiateObject(Isolate* isolate,
 }
 
 
-void InstallInCache(Isolate* isolate, int serial_number,
-                    Handle<JSFunction> function) {
+void CacheFunction(Isolate* isolate, Handle<Smi> serial_number,
+                   Handle<JSFunction> function) {
   auto cache = isolate->function_cache();
-  if (cache->length() <= serial_number) {
-    int new_size;
-    if (isolate->next_serial_number() < 50) {
-      new_size = 100;
-    } else {
-      new_size = 3 * isolate->next_serial_number() / 2;
-    }
-    cache = FixedArray::CopySize(cache, new_size);
-    isolate->native_context()->set_function_cache(*cache);
-  }
-  cache->set(serial_number, *function);
+  auto new_cache = ObjectHashTable::Put(cache, serial_number, function);
+  isolate->native_context()->set_function_cache(*new_cache);
+}
+
+
+void UncacheFunction(Isolate* isolate, Handle<Smi> serial_number) {
+  auto cache = isolate->function_cache();
+  bool was_present = false;
+  auto new_cache = ObjectHashTable::Remove(cache, serial_number, &was_present);
+  DCHECK(was_present);
+  isolate->native_context()->set_function_cache(*new_cache);
 }
 
 
 MaybeHandle<JSFunction> InstantiateFunction(Isolate* isolate,
                                             Handle<FunctionTemplateInfo> data,
                                             Handle<Name> name) {
-  int serial_number = Smi::cast(data->serial_number())->value();
+  auto serial_number = handle(Smi::cast(data->serial_number()), isolate);
   // Probe cache.
   if (!data->do_not_cache()) {
     auto cache = isolate->function_cache();
-    // Fast case: see if the function has already been instantiated
-    if (serial_number < cache->length()) {
-      Handle<Object> element = FixedArray::get(cache, serial_number);
-      if (element->IsJSFunction()) {
-        return Handle<JSFunction>::cast(element);
-      }
+    Object* element = cache->Lookup(serial_number);
+    if (element->IsJSFunction()) {
+      return handle(JSFunction::cast(element), isolate);
     }
   }
   // Enter a new scope.  Recursion could otherwise create a lot of handles.
@@ -279,15 +264,14 @@ MaybeHandle<JSFunction> InstantiateFunction(Isolate* isolate,
     function->shared()->set_name(*name);
   }
   if (!data->do_not_cache()) {
-    // Cache the function to limit recursion.
-    InstallInCache(isolate, serial_number, function);
+    // Cache the function.
+    CacheFunction(isolate, serial_number, function);
   }
   auto result = ConfigureInstance(isolate, function, data);
   if (result.is_null()) {
-    // uncache on error.
+    // Uncache on error.
     if (!data->do_not_cache()) {
-      auto cache = isolate->function_cache();
-      cache->set(serial_number, isolate->heap()->undefined_value());
+      UncacheFunction(isolate, serial_number);
     }
     return MaybeHandle<JSFunction>();
   }
@@ -321,8 +305,8 @@ void AddPropertyToPropertyList(Isolate* isolate, Handle<TemplateInfo> templ,
     list = NeanderArray(isolate).value();
     templ->set_property_list(*list);
   }
+  templ->set_number_of_properties(templ->number_of_properties() + 1);
   NeanderArray array(list);
-  array.add(isolate, isolate->factory()->NewNumberFromInt(length));
   for (int i = 0; i < length; i++) {
     Handle<Object> value =
         data[i].is_null()
@@ -371,10 +355,9 @@ void ApiNatives::AddDataProperty(Isolate* isolate, Handle<TemplateInfo> info,
                                  Handle<Name> name, Handle<Object> value,
                                  PropertyAttributes attributes) {
   const int kSize = 3;
-  DCHECK(Smi::IsValid(static_cast<int>(attributes)));
-  auto attribute_handle =
-      handle(Smi::FromInt(static_cast<int>(attributes)), isolate);
-  Handle<Object> data[kSize] = {name, value, attribute_handle};
+  PropertyDetails details(attributes, DATA, 0, PropertyCellType::kNoCell);
+  auto details_handle = handle(details.AsSmi(), isolate);
+  Handle<Object> data[kSize] = {name, details_handle, value};
   AddPropertyToPropertyList(isolate, info, kSize, data);
 }
 
@@ -386,10 +369,9 @@ void ApiNatives::AddAccessorProperty(Isolate* isolate,
                                      Handle<FunctionTemplateInfo> setter,
                                      PropertyAttributes attributes) {
   const int kSize = 4;
-  DCHECK(Smi::IsValid(static_cast<int>(attributes)));
-  auto attribute_handle =
-      handle(Smi::FromInt(static_cast<int>(attributes)), isolate);
-  Handle<Object> data[kSize] = {name, getter, setter, attribute_handle};
+  PropertyDetails details(attributes, ACCESSOR, 0, PropertyCellType::kNoCell);
+  auto details_handle = handle(details.AsSmi(), isolate);
+  Handle<Object> data[kSize] = {name, details_handle, getter, setter};
   AddPropertyToPropertyList(isolate, info, kSize, data);
 }
 

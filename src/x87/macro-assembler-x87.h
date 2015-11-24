@@ -13,6 +13,19 @@
 namespace v8 {
 namespace internal {
 
+// Give alias names to registers for calling conventions.
+const Register kReturnRegister0 = {kRegister_eax_Code};
+const Register kReturnRegister1 = {kRegister_edx_Code};
+const Register kJSFunctionRegister = {kRegister_edi_Code};
+const Register kContextRegister = {kRegister_esi_Code};
+const Register kInterpreterAccumulatorRegister = {kRegister_eax_Code};
+const Register kInterpreterRegisterFileRegister = {kRegister_edx_Code};
+const Register kInterpreterBytecodeOffsetRegister = {kRegister_ecx_Code};
+const Register kInterpreterBytecodeArrayRegister = {kRegister_edi_Code};
+const Register kInterpreterDispatchTableRegister = {kRegister_ebx_Code};
+const Register kRuntimeCallFunctionRegister = {kRegister_ebx_Code};
+const Register kRuntimeCallArgCountRegister = {kRegister_eax_Code};
+
 // Convenience for platform-independent signatures.  We do not normally
 // distinguish memory operands from other operands on ia32.
 typedef Operand MemOperand;
@@ -535,17 +548,11 @@ class MacroAssembler: public Assembler {
   // ---------------------------------------------------------------------------
   // Exception handling
 
-  // Push a new try handler and link it into try handler chain.
-  void PushTryHandler(StackHandler::Kind kind, int handler_index);
+  // Push a new stack handler and link it into stack handler chain.
+  void PushStackHandler();
 
-  // Unlink the stack handler on top of the stack from the try handler chain.
-  void PopTryHandler();
-
-  // Throw to the top handler in the try hander chain.
-  void Throw(Register value);
-
-  // Throw past all JS frames to the top JS entry frame.
-  void ThrowUncatchable(Register value);
+  // Unlink the stack handler on top of the stack from the stack handler chain.
+  void PopStackHandler();
 
   // ---------------------------------------------------------------------------
   // Inline caching support
@@ -572,7 +579,7 @@ class MacroAssembler: public Assembler {
   // ---------------------------------------------------------------------------
   // Allocation support
 
-  // Allocate an object in new space or old pointer space. If the given space
+  // Allocate an object in new space or old space. If the given space
   // is exhausted control continues at the gc_required label. The allocated
   // object is returned in result and end of the new object is returned in
   // result_end. The register scratch can be passed as no_reg in which case
@@ -605,12 +612,6 @@ class MacroAssembler: public Assembler {
                 Register scratch,
                 Label* gc_required,
                 AllocationFlags flags);
-
-  // Undo allocation in new space. The object passed and objects allocated after
-  // it will no longer be allocated. Make sure that no pointers are left to the
-  // object(s) no longer allocated as they would be invalid when allocation is
-  // un-done.
-  void UndoAllocationInNewSpace(Register object);
 
   // Allocate a heap number in new space with undefined value. The
   // register scratch2 can be passed as no_reg; the others must be
@@ -682,6 +683,10 @@ class MacroAssembler: public Assembler {
   // Register scratch is destroyed, and it must be different from op2.
   void NegativeZeroTest(Register result, Register op1, Register op2,
                         Register scratch, Label* then_label);
+
+  // Machine code version of Map::GetConstructor().
+  // |temp| holds |result|'s map when done.
+  void GetMapConstructor(Register result, Register map, Register temp);
 
   // Try to get function prototype of a function and puts the value in
   // the result register. Checks that the function really is a
@@ -777,6 +782,9 @@ class MacroAssembler: public Assembler {
   void Call(Label* target) { call(target); }
   void Push(Register src) { push(src); }
   void Pop(Register dst) { pop(dst); }
+
+  void Lzcnt(Register dst, Register src) { Lzcnt(dst, Operand(src)); }
+  void Lzcnt(Register dst, const Operand& src);
 
   // Emit call to the code we are currently generating.
   void CallSelf() {
@@ -966,10 +974,6 @@ class MacroAssembler: public Assembler {
                           Register bitmap_reg,
                           Register mask_reg);
 
-  // Helper for throwing exceptions.  Compute a handler address and jump to
-  // it.  See the implementation for register usage.
-  void JumpToHandlerEntry();
-
   // Compute memory operands for safepoint stack slots.
   Operand SafepointRegisterSlot(Register reg);
   static int SafepointRegisterStackIndex(int reg_code);
@@ -988,7 +992,7 @@ class MacroAssembler: public Assembler {
 class CodePatcher {
  public:
   CodePatcher(byte* address, int size);
-  virtual ~CodePatcher();
+  ~CodePatcher();
 
   // Macro assembler to emit code.
   MacroAssembler* masm() { return &masm_; }
@@ -1028,6 +1032,11 @@ inline Operand FixedArrayElementOperand(Register array,
 
 inline Operand ContextOperand(Register context, int index) {
   return Operand(context, Context::SlotOffset(index));
+}
+
+
+inline Operand ContextOperand(Register context, Register index) {
+  return Operand(context, index, times_pointer_size, Context::SlotOffset(0));
 }
 
 

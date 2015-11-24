@@ -6,12 +6,19 @@
 #define V8_API_NATIVES_H_
 
 #include "src/handles.h"
+#include "src/property-details.h"
 
 namespace v8 {
 namespace internal {
 
+// Forward declarations.
+class ObjectTemplateInfo;
+class TemplateInfo;
+
 class ApiNatives {
  public:
+  static const int kInitialFunctionCacheSize = 256;
+
   MUST_USE_RESULT static MaybeHandle<JSFunction> InstantiateFunction(
       Handle<FunctionTemplateInfo> data);
 

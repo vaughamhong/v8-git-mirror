@@ -2,13 +2,12 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#include "src/v8.h"
+#include "src/runtime/runtime-utils.h"
 
 #include "src/arguments.h"
 #include "src/base/bits.h"
 #include "src/bootstrapper.h"
 #include "src/codegen.h"
-#include "src/runtime/runtime-utils.h"
 
 
 #ifndef _STLP_VENDOR_CSTD
@@ -185,13 +184,7 @@ RUNTIME_FUNCTION(Runtime_StringToNumber) {
   }
 
   // Slower case.
-  int flags = ALLOW_HEX;
-  if (FLAG_harmony_numeric_literals) {
-    // The current spec draft has not updated "ToNumber Applied to the String
-    // Type", https://bugs.ecmascript.org/show_bug.cgi?id=1584
-    flags |= ALLOW_OCTAL | ALLOW_BINARY;
-  }
-
+  int flags = ALLOW_HEX | ALLOW_OCTAL | ALLOW_BINARY;
   return *isolate->factory()->NewNumber(
       StringToDouble(isolate->unicode_cache(), subject, flags));
 }
@@ -237,7 +230,7 @@ RUNTIME_FUNCTION(Runtime_StringParseFloat) {
 }
 
 
-RUNTIME_FUNCTION(Runtime_NumberToStringRT) {
+RUNTIME_FUNCTION(Runtime_NumberToString) {
   HandleScope scope(isolate);
   DCHECK(args.length() == 1);
   CONVERT_NUMBER_ARG_HANDLE_CHECKED(number, 0);
@@ -274,24 +267,6 @@ RUNTIME_FUNCTION(Runtime_NumberToIntegerMapMinusZero) {
   if (double_value == 0) double_value = 0;
 
   return *isolate->factory()->NewNumber(double_value);
-}
-
-
-RUNTIME_FUNCTION(Runtime_NumberToJSUint32) {
-  HandleScope scope(isolate);
-  DCHECK(args.length() == 1);
-
-  CONVERT_NUMBER_CHECKED(int32_t, number, Uint32, args[0]);
-  return *isolate->factory()->NewNumberFromUint(number);
-}
-
-
-RUNTIME_FUNCTION(Runtime_NumberToJSInt32) {
-  HandleScope scope(isolate);
-  DCHECK(args.length() == 1);
-
-  CONVERT_DOUBLE_ARG_CHECKED(number, 0);
-  return *isolate->factory()->NewNumberFromInt(DoubleToInt32(number));
 }
 
 
@@ -557,14 +532,6 @@ RUNTIME_FUNCTION(Runtime_SmiLexicographicCompare) {
 }
 
 
-RUNTIME_FUNCTION(Runtime_GetRootNaN) {
-  SealHandleScope shs(isolate);
-  DCHECK(args.length() == 0);
-  RUNTIME_ASSERT(isolate->bootstrapper()->IsActive());
-  return isolate->heap()->nan_value();
-}
-
-
 RUNTIME_FUNCTION(Runtime_MaxSmi) {
   SealHandleScope shs(isolate);
   DCHECK(args.length() == 0);
@@ -572,13 +539,7 @@ RUNTIME_FUNCTION(Runtime_MaxSmi) {
 }
 
 
-RUNTIME_FUNCTION(RuntimeReference_NumberToString) {
-  SealHandleScope shs(isolate);
-  return __RT_impl_Runtime_NumberToStringRT(args, isolate);
-}
-
-
-RUNTIME_FUNCTION(RuntimeReference_IsSmi) {
+RUNTIME_FUNCTION(Runtime_IsSmi) {
   SealHandleScope shs(isolate);
   DCHECK(args.length() == 1);
   CONVERT_ARG_CHECKED(Object, obj, 0);
@@ -586,12 +547,19 @@ RUNTIME_FUNCTION(RuntimeReference_IsSmi) {
 }
 
 
-RUNTIME_FUNCTION(RuntimeReference_IsNonNegativeSmi) {
+RUNTIME_FUNCTION(Runtime_IsNonNegativeSmi) {
   SealHandleScope shs(isolate);
   DCHECK(args.length() == 1);
   CONVERT_ARG_CHECKED(Object, obj, 0);
   return isolate->heap()->ToBoolean(obj->IsSmi() &&
                                     Smi::cast(obj)->value() >= 0);
 }
+
+
+RUNTIME_FUNCTION(Runtime_GetRootNaN) {
+  SealHandleScope shs(isolate);
+  DCHECK(args.length() == 0);
+  return isolate->heap()->nan_value();
 }
-}  // namespace v8::internal
+}  // namespace internal
+}  // namespace v8

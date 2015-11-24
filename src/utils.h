@@ -41,7 +41,7 @@ inline int WhichPowerOf2(uint32_t x) {
   DCHECK(base::bits::IsPowerOfTwo32(x));
   int bits = 0;
 #ifdef DEBUG
-  int original_x = x;
+  uint32_t original_x = x;
 #endif
   if (x >= 0x10000) {
     bits += 16;
@@ -62,7 +62,42 @@ inline int WhichPowerOf2(uint32_t x) {
     case 2: bits++;  // Fall through.
     case 1: break;
   }
-  DCHECK_EQ(1 << bits, original_x);
+  DCHECK_EQ(static_cast<uint32_t>(1) << bits, original_x);
+  return bits;
+}
+
+
+// X must be a power of 2.  Returns the number of trailing zeros.
+inline int WhichPowerOf2_64(uint64_t x) {
+  DCHECK(base::bits::IsPowerOfTwo64(x));
+  int bits = 0;
+#ifdef DEBUG
+  uint64_t original_x = x;
+#endif
+  if (x >= 0x100000000L) {
+    bits += 32;
+    x >>= 32;
+  }
+  if (x >= 0x10000) {
+    bits += 16;
+    x >>= 16;
+  }
+  if (x >= 0x100) {
+    bits += 8;
+    x >>= 8;
+  }
+  if (x >= 0x10) {
+    bits += 4;
+    x >>= 4;
+  }
+  switch (x) {
+    default: UNREACHABLE();
+    case 8: bits++;  // Fall through.
+    case 4: bits++;  // Fall through.
+    case 2: bits++;  // Fall through.
+    case 1: break;
+  }
+  DCHECK_EQ(static_cast<uint64_t>(1) << bits, original_x);
   return bits;
 }
 
@@ -208,7 +243,7 @@ class BitFieldBase {
   static const U kNext = kShift + kSize;
 
   // Value for the field with all bits set.
-  static const T kMax = static_cast<T>((1U << size) - 1);
+  static const T kMax = static_cast<T>((kOne << size) - 1);
 
   // Tells whether the provided value fits into the bit field.
   static bool is_valid(T value) {
@@ -305,7 +340,7 @@ inline uint32_t ComputeIntegerHash(uint32_t key, uint32_t seed) {
   hash = hash ^ (hash >> 4);
   hash = hash * 2057;  // hash = (hash + (hash << 3)) + (hash << 11);
   hash = hash ^ (hash >> 16);
-  return hash;
+  return hash & 0x3fffffff;
 }
 
 
@@ -605,7 +640,14 @@ class Collector {
   }
 
   // Resets the collector to be empty.
-  virtual void Reset();
+  virtual void Reset() {
+    for (int i = chunks_.length() - 1; i >= 0; i--) {
+      chunks_.at(i).Dispose();
+    }
+    chunks_.Rewind(0);
+    index_ = 0;
+    size_ = 0;
+  }
 
   // Total number of elements added to collector so far.
   inline int size() { return size_; }
@@ -1005,23 +1047,31 @@ template <int dummy_parameter>
 class VectorSlot {
  public:
   explicit VectorSlot(int id) : id_(id) {}
+
   int ToInt() const { return id_; }
 
   static VectorSlot Invalid() { return VectorSlot(kInvalidSlot); }
   bool IsInvalid() const { return id_ == kInvalidSlot; }
 
   VectorSlot next() const {
-    DCHECK(id_ != kInvalidSlot);
+    DCHECK_NE(kInvalidSlot, id_);
     return VectorSlot(id_ + 1);
   }
 
-  bool operator==(const VectorSlot& other) const { return id_ == other.id_; }
+  bool operator==(VectorSlot that) const { return this->id_ == that.id_; }
+  bool operator!=(VectorSlot that) const { return !(*this == that); }
 
  private:
   static const int kInvalidSlot = -1;
 
   int id_;
 };
+
+
+template <int dummy_parameter>
+size_t hash_value(VectorSlot<dummy_parameter> slot) {
+  return slot.ToInt();
+}
 
 
 typedef VectorSlot<0> FeedbackVectorSlot;
@@ -1066,21 +1116,6 @@ class BailoutId {
 };
 
 
-template <class C>
-class ContainerPointerWrapper {
- public:
-  typedef typename C::iterator iterator;
-  typedef typename C::reverse_iterator reverse_iterator;
-  explicit ContainerPointerWrapper(C* container) : container_(container) {}
-  iterator begin() { return container_->begin(); }
-  iterator end() { return container_->end(); }
-  reverse_iterator rbegin() { return container_->rbegin(); }
-  reverse_iterator rend() { return container_->rend(); }
- private:
-  C* container_;
-};
-
-
 // ----------------------------------------------------------------------------
 // I/O support.
 
@@ -1112,6 +1147,9 @@ void FPRINTF_CHECKING PrintF(FILE* out, const char* format, ...);
 
 // Prepends the current process ID to the output.
 void PRINTF_CHECKING PrintPID(const char* format, ...);
+
+// Prepends the current process ID and given isolate pointer to the output.
+void PrintIsolate(void* isolate, const char* format, ...);
 
 // Safe formatting print. Ensures that str is always null-terminated.
 // Returns the number of chars written, or -1 if output was truncated.
@@ -1660,7 +1698,7 @@ bool StringToArrayIndex(Stream* stream, uint32_t* index) {
     d = stream->GetNext() - '0';
     if (d < 0 || d > 9) return false;
     // Check that the new result is below the 32 bit limit.
-    if (result > 429496729U - ((d > 5) ? 1 : 0)) return false;
+    if (result > 429496729U - ((d + 3) >> 3)) return false;
     result = (result * 10) + d;
   }
 
@@ -1676,6 +1714,41 @@ inline uintptr_t GetCurrentStackPosition() {
   // the top of stack is right now.
   uintptr_t limit = reinterpret_cast<uintptr_t>(&limit);
   return limit;
+}
+
+static inline double ReadDoubleValue(const void* p) {
+#ifndef V8_TARGET_ARCH_MIPS
+  return *reinterpret_cast<const double*>(p);
+#else   // V8_TARGET_ARCH_MIPS
+  // Prevent compiler from using load-double (mips ldc1) on (possibly)
+  // non-64-bit aligned address.
+  union conversion {
+    double d;
+    uint32_t u[2];
+  } c;
+  const uint32_t* ptr = reinterpret_cast<const uint32_t*>(p);
+  c.u[0] = *ptr;
+  c.u[1] = *(ptr + 1);
+  return c.d;
+#endif  // V8_TARGET_ARCH_MIPS
+}
+
+
+static inline void WriteDoubleValue(void* p, double value) {
+#ifndef V8_TARGET_ARCH_MIPS
+  *(reinterpret_cast<double*>(p)) = value;
+#else   // V8_TARGET_ARCH_MIPS
+  // Prevent compiler from using load-double (mips sdc1) on (possibly)
+  // non-64-bit aligned address.
+  union conversion {
+    double d;
+    uint32_t u[2];
+  } c;
+  c.d = value;
+  uint32_t* ptr = reinterpret_cast<uint32_t*>(p);
+  *ptr = c.u[0];
+  *(ptr + 1) = c.u[1];
+#endif  // V8_TARGET_ARCH_MIPS
 }
 
 }  // namespace internal
